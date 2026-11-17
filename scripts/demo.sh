@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# End-to-end demo of the PITR recovery flow:
+# End-to-end demo of the PITR recovery flow, including the strict-retirement
+# guarantees added for the "old replica stop failure" incident:
+#
 #   collect -> restore point -> accidental delete -> keep collecting -> recover
+#   -> fetch deleted rows on the replica -> switch to a second restore point
+#   -> simulate an old replica that refuses to stop (new recovery rejected,
+#      old replica keeps serving, its directory preserved)
+#   -> clear the fault -> retry succeeds without any service restart
+#
 # Run against a live stack (default http://localhost:8000; override with BASE).
 set -euo pipefail
 
 BASE="${BASE:-http://localhost:8000}"
 POINT="${POINT:-before_delete}"
+POINT2="${POINT2:-before_delete_2}"
 
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -82,4 +90,74 @@ say "9. assertions"
 [ "$primary_total" = "36" ] || fail "primary should hold 36 rows (30 left + 6 new), got $primary_total"
 [ "$primary_ixb"  = "6"  ] || fail "primary should hold 6 IXB rows, got $primary_ixb"
 
-printf '\n\033[32mDEMO OK: deleted rows recovered on the isolated replica; the primary kept collecting.\033[0m\n'
+say "10. switch restore points: create a second point and recover to it"
+# More collection, then a second restore point (strictly later than the first).
+curl -fsS -X POST "$BASE/demo/generate?intersections=2&minutes=2&prefix=IXC" >/dev/null
+curl -fsS -X POST "$BASE/restore-points?name=$POINT2" | jq .
+for _ in $(seq 1 60); do
+  rp2=$(curl -fsS "$BASE/restore-points" | jq -r --arg p "$POINT2" \
+        '.items[] | select(.name==$p) | .status')
+  [ "$rp2" = "ready" ] && break
+  sleep 2
+done
+[ "${rp2:-}" = "ready" ] || fail "second restore point never became ready"
+
+rec2=$(curl -fsS -X POST "$BASE/recoveries" -H 'Content-Type: application/json' \
+       -d "{\"restore_point\":\"$POINT2\"}")
+rid2=$(echo "$rec2" | jq -r .id)
+for _ in $(seq 1 90); do
+  st2=$(curl -fsS "$BASE/recoveries/$rid2" | jq -r .status)
+  [ "$st2" = "success" ] && break
+  if [ "$st2" = "failed" ]; then
+    curl -fsS "$BASE/recoveries/$rid2" | jq .
+    fail "second recovery failed"
+  fi
+  sleep 2
+done
+[ "$st2" = "success" ] || fail "second recovery did not succeed (last: $st2)"
+# the old job is now superseded; only the new one is served
+[ "$(curl -fsS "$BASE/recoveries/$rid"  | jq -r .status)" = "superseded" ] \
+  || fail "first recovery should be superseded after the switch"
+[ "$(curl -fsS "$BASE/recoveries/current" | jq -r .id)" = "$rid2" ] \
+  || fail "current recovery should be the new one"
+# the second replica serves its own point: it must contain the IXC rows
+ixc=$(curl -fsS "$BASE/replica/traffic?limit=1000" \
+      | jq '[.rows[] | select(.intersection_id | startswith("IXC"))] | length')
+[ "$ixc" = "4" ] || fail "second replica should contain 4 IXC rows, got $ixc"
+echo "switch OK: replica now serves '$POINT2' (IXC rows present), task $rid superseded"
+
+say "11. fault injection: old replica refuses to stop -> new recovery rejected"
+curl -fsS -X PUT "$BASE/demo/faults" -H 'Content-Type: application/json' \
+     -d '{"simulate_stop_failure": true}' | jq .
+blocked=$(curl -sS -o /tmp/blocked.json -w '%{http_code}' -X POST \
+          "$BASE/recoveries" -H 'Content-Type: application/json' \
+          -d "{\"restore_point\":\"$POINT\"}")
+[ "$blocked" = "409" ] || fail "expected 409 while old postmaster is alive, got $blocked"
+jq . /tmp/blocked.json
+# no new job was created; the healthy old replica keeps serving its own point
+[ "$(curl -fsS "$BASE/recoveries/current" | jq -r .id)" = "$rid2" ] \
+  || fail "old replica must stay the served one after a rejected switch"
+curl -fsS "$BASE/replica/traffic?limit=1" | jq '{served_recovery: .recovery.id, total_rows}'
+# task history is still queryable, and the primary kept collecting throughout
+curl -fsS "$BASE/primary/traffic?limit=1" | jq '{primary_total_rows: .total_rows}'
+
+say "12. clear the fault and retry - no service restart"
+curl -fsS -X PUT "$BASE/demo/faults" -H 'Content-Type: application/json' -d '{}' | jq .
+rec3=$(curl -fsS -X POST "$BASE/recoveries" -H 'Content-Type: application/json' \
+       -d "{\"restore_point\":\"$POINT\"}")
+rid3=$(echo "$rec3" | jq -r .id)
+for _ in $(seq 1 90); do
+  st3=$(curl -fsS "$BASE/recoveries/$rid3" | jq -r .status)
+  [ "$st3" = "success" ] && break
+  if [ "$st3" = "failed" ]; then
+    curl -fsS "$BASE/recoveries/$rid3" | jq .
+    fail "retried recovery failed"
+  fi
+  sleep 2
+done
+[ "$st3" = "success" ] || fail "retried recovery did not succeed (last: $st3)"
+[ "$(curl -fsS "$BASE/recoveries/current" | jq -r .id)" = "$rid3" ] \
+  || fail "current recovery should be the retried one"
+echo "retry OK: recovery $rid3 succeeded after the fault was cleared (api never restarted)"
+
+printf '\n\033[32mDEMO OK: strict retirement holds, switch/query/retry all work, primary kept collecting.\033[0m\n'

@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 import os
 import threading
-import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
@@ -31,23 +30,28 @@ log = logging.getLogger("api")
 
 NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
 
+# Background loops are stoppable so lifespan shutdown (and test teardown)
+# cannot leave daemon threads acting on state that outlives the app instance.
+_bg_stop = threading.Event()
+_bg_threads: list[threading.Thread] = []
+
 
 def _readiness_loop():
-    while True:
+    while not _bg_stop.is_set():
         try:
             recovery.refresh_restore_points()
         except Exception:
             log.exception("readiness refresh failed")
-        time.sleep(2)
+        _bg_stop.wait(2)
 
 
 def _monitor_loop():
-    while True:
+    while not _bg_stop.is_set():
         try:
             recovery.monitor_current()
         except Exception:
             log.exception("replica monitor failed")
-        time.sleep(3)
+        _bg_stop.wait(3)
 
 
 @asynccontextmanager
@@ -56,16 +60,28 @@ async def lifespan(_app):
     os.makedirs(os.path.dirname(config.STATE_DB), exist_ok=True)
     state.init()
     recovery.cleanup_on_startup()
+    _bg_stop.clear()
+    _bg_threads.clear()
     # physical base backup is established at startup, in the background
-    threading.Thread(target=backup.run_base_backup, daemon=True, name="base-backup").start()
-    threading.Thread(target=_readiness_loop, daemon=True, name="readiness").start()
-    threading.Thread(target=_monitor_loop, daemon=True, name="monitor").start()
+    targets = [
+        (backup.run_base_backup, "base-backup"),
+        (_readiness_loop, "readiness"),
+        (_monitor_loop, "monitor"),
+    ]
+    for target, name in targets:
+        thread = threading.Thread(target=target, daemon=True, name=name)
+        thread.start()
+        _bg_threads.append(thread)
     yield
+    _bg_stop.set()
+    for thread in _bg_threads:
+        thread.join(timeout=5)
+    _bg_threads.clear()
 
 
 app = FastAPI(
     title="Traffic PITR Recovery API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Physical point-in-time recovery for the traffic_minute_counts table. "
         "Flow: 1) POST /demo/generate to simulate collection, "
@@ -73,7 +89,13 @@ app = FastAPI(
         "3) POST /demo/delete to simulate the accidental deletion, "
         "4) POST /recoveries to rebuild an isolated read-only replica at the "
         "restore point, 5) GET /replica/traffic to fetch the lost rows. "
-        "The primary keeps collecting the whole time."
+        "The primary keeps collecting the whole time.\n\n"
+        "Switching restore points strictly retires the old replica first: its "
+        "postmaster must be confirmed dead before its directory is removed or a "
+        "new recovery is accepted. If the old process cannot be stopped, the new "
+        "request is rejected with 409 and the healthy old replica keeps serving "
+        "its original restore point. Use POST /demo/faults to exercise the "
+        "stop-failure protection and the fail-then-retry flow from this UI."
     ),
     lifespan=lifespan,
 )
@@ -161,8 +183,14 @@ class RecoveryRequest(BaseModel):
 def start_recovery(req: RecoveryRequest):
     """Start a recovery to a named restore point (only one may be in flight).
 
-    Rebuilds a fresh isolated replica from the physical base backup; any
-    previously served replica is retired first, so points are never mixed.
+    Rebuilds a fresh isolated replica from the physical base backup. Any
+    previously served replica is retired *strictly* first: the old
+    postmaster is confirmed dead and its directory removed before the new
+    recovery is accepted. If the old postmaster cannot be stopped (still
+    alive after fast/immediate shutdown), this returns 409, the old
+    directory is preserved, and the healthy old replica keeps serving its
+    original restore point. Retry the same request after the stuck process
+    is fixed -- no service restart needed.
     """
     try:
         return recovery.start_recovery(req.restore_point)
@@ -237,6 +265,53 @@ def replica_traffic(
         },
         "total_rows": total,
         "rows": rows,
+    }
+
+
+# --------------------------------------------------------------------------
+# demo: fault injection (exercises retirement protection and retry)
+# --------------------------------------------------------------------------
+
+class FaultRequest(BaseModel):
+    simulate_stop_failure: bool = Field(
+        default=False,
+        description=(
+            "Make the NEXT replica retirement pretend pg_ctl stop failed while "
+            "the postmaster is still alive. The next POST /recoveries must then "
+            "be rejected with 409, the old replica directory preserved, and the "
+            "old replica keep serving its original restore point."
+        ),
+    )
+    simulate_start_failure: bool = Field(
+        default=False,
+        description=(
+            "Make the NEXT replica postmaster start fail (one-shot), producing "
+            "a failed recovery whose directory is cleaned up. Clearing the "
+            "flag and posting /recoveries again demonstrates retry without any "
+            "service restart."
+        ),
+    )
+
+
+@app.put("/demo/faults", tags=["demo"])
+def set_faults(req: FaultRequest):
+    """Set/clear demo-only fault injection switches (see /demo/faults)."""
+    state.kv_set("fault_stop_failure", "1" if req.simulate_stop_failure else "")
+    state.kv_set("fault_start_failure", "1" if req.simulate_start_failure else "")
+    return get_faults()
+
+
+@app.get("/demo/faults", tags=["demo"])
+def get_faults():
+    """Show the current demo fault injection switches."""
+    return {
+        "simulate_stop_failure": bool(state.kv_get("fault_stop_failure")),
+        "simulate_start_failure": bool(state.kv_get("fault_start_failure")),
+        "note": (
+            "demo-only switches. stop failure: old postmaster kept alive and "
+            "new recovery rejected (409); start failure: next recovery fails "
+            "and can be retried after clearing the switch, no restart needed."
+        ),
     }
 
 
